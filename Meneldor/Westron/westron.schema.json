@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://thorondor/westron.schema.json",
+  "title": "Westron — Thorondor shared radio configuration contract",
+  "description": "One contract for both stacks. THORONDOR // component=westron-schema // stack=both // status=draft. Structural rules live here; cross-field/semantic rules (referential integrity, superframe math, conditional requirements) are enforced by validate_westron.py.",
+  "type": "object",
+  "required": ["version", "name", "radios"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "geo": { "$ref": "#/$defs/geo" },
+    "defaults": { "type": "object" },
+    "radios": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/radio" }
+    }
+  },
+  "$defs": {
+    "geo": {
+      "type": "object",
+      "required": ["lat", "lon"],
+      "additionalProperties": false,
+      "properties": {
+        "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+        "lon": { "type": "number", "minimum": -180, "maximum": 180 },
+        "uncertainty_m": { "type": "number", "minimum": 0 }
+      }
+    },
+    "transport": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["local", "tcp"] },
+        "host": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "substrate": {
+      "type": "object",
+      "required": ["device", "transport"],
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "enum": ["usrp", "lime", "bladerf", "hackrf", "pluto", "xtrx", "sidekiq",
+                   "rtlsdr", "airspy", "sdrplay", "kraken", "other"]
+        },
+        "driver_args": { "type": "string" },
+        "arch": { "enum": ["x86_64", "arm64", "any"] },
+        "transport": { "$ref": "#/$defs/transport" }
+      }
+    },
+    "radio": {
+      "type": "object",
+      "required": ["id", "stack"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "stack": { "enum": ["802.11", "802.22"] },
+        "netdev": { "type": "string" },
+        "substrate": { "$ref": "#/$defs/substrate" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "stack": { "const": "802.11" } } },
+          "then": {
+            "required": ["iface", "rf"],
+            "properties": {
+              "iface": { "type": "string" },
+              "rf": {
+                "type": "object",
+                "required": ["freq_mhz", "bw_mhz"],
+                "properties": {
+                  "freq_mhz": { "type": "number", "exclusiveMinimum": 0 },
+                  "bw_mhz": { "enum": [20, 40, 80, 160] }
+                }
+              },
+              "mac": {
+                "type": "object",
+                "properties": { "mode": { "enum": ["scheduled", "contention", "none"] } }
+              },
+              "txpower_dbm": { "type": "number" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "stack": { "const": "802.22" } } },
+          "then": {
+            "required": ["role", "rf", "superframe", "substrate"],
+            "properties": {
+              "role": { "enum": ["bs", "cpe"] },
+              "serving_bs": { "type": "string" },
+              "cpes": { "type": "array", "items": { "type": "string" } },
+              "rf": {
+                "type": "object",
+                "required": ["center_mhz", "channel_bw_mhz", "tx_power_dbm"],
+                "properties": {
+                  "center_mhz": { "type": "number", "minimum": 54, "maximum": 862 },
+                  "channel_bw_mhz": { "enum": [6, 7, 8] },
+                  "tx_power_dbm": { "type": "number" }
+                }
+              },
+              "superframe": {
+                "type": "object",
+                "required": ["frame_ms", "superframe_ms", "guard_us"],
+                "properties": {
+                  "frame_ms": { "type": "number", "exclusiveMinimum": 0 },
+                  "superframe_ms": { "type": "number", "exclusiveMinimum": 0 },
+                  "guard_us": { "type": "number", "exclusiveMinimum": 0 }
+                }
+              },
+              "service_flows": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "direction", "qos"],
+                  "properties": {
+                    "id": { "type": "string" },
+                    "direction": { "enum": ["up", "down", "bidir"] },
+                    "qos": { "enum": ["be", "nrtps", "rtps", "ertps", "ugs"] },
+                    "rate_kbps": { "type": "number", "minimum": 0 }
+                  }
+                }
+              },
+              "sensing": {
+                "type": "object",
+                "required": ["enabled"],
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "quiet_period_ms": { "type": "number", "exclusiveMinimum": 0 },
+                  "threshold_dbm": { "type": "number" },
+                  "incumbents": { "type": "array", "items": { "type": "string" } }
+                }
+              },
+              "wsdb": {
+                "type": "object",
+                "required": ["enabled"],
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "db_url": { "type": "string" },
+                  "geo": { "$ref": "#/$defs/geo" }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

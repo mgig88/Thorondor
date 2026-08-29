@@ -1,249 +1,212 @@
-# radioctl + radio-inject — heterogeneous radio control plane & L2.5 injector
+<!-- THORONDOR // component=custom-stack-readme // stack=both // status=living-doc -->
+# Thorondor — custom radio infrastructure (Gwaihir engine · Westron config)
 
-A control-plane CLI and raw-injection tool for running custom, disparate Layer-2
-protocols (e.g. an 802.22-derived scheduled MAC) over a fleet of heterogeneous radios —
-from a least-constrained "L2.5" overlay on Wi-Fi silicon up to a fully custom MAC/PHY
-SDR — with a hardware-free validation path so the software is provable without a radio in
-the loop.
+Dedicated README for the **purpose-built** part of Thorondor: the custom kernel engine,
+SDR substrate support, and the shared config model that replace OpenWrt's nuts-and-bolts
+**where the protocol requires it**. This document is **living** — updated every time a
+new piece here is tested and accepted (see the Acceptance Ledger at the bottom).
+
+> This is separate from the top-level project README, which covers the OpenWrt-hosted
+> 802.11 tooling (Meneldor / `radioctl` / `radio-inject`). Keep the two concerns isolated.
 
 ---
 
 ## BLUF
 
-- **What it is.** One operator CLI (`radioctl`, in bash **and** PowerShell) built on a
-  Hardware Abstraction Layer with four interchangeable backends (`mock`, `wifi-overlay`,
-  `wifi-mac`, `sdr`), plus `radio-inject`, a stdlib-only raw 802.11 broadcast injector
-  that puts your L2.5 PDUs on the air with the hardware MAC neutralised (broadcast +
-  radiotap NOACK/NOSEQ, so **your** L2 owns reliability and ordering).
-- **Why this shape.** The same command surface and the same netdev seam span every radio
-  class, so you validate L2 logic on a real-but-wrong radio (surrogate PHY) long before
-  the TVWS SDR path exists, then swap the PHY underneath without touching the upper layers.
-- **Verification status.** The software logic is proven by a Monte Carlo campaign:
-  **20,765 randomized assertions, 0 defects** on every executable path (`radio-inject`
-  20,015 + `radioctl.sh` 750). `radioctl.ps1` is parity-verified (29/29 backend functions,
-  identical command surface) with a Windows harness to confirm on real PowerShell. A
-  GitHub Actions **regression gate** re-runs the whole campaign on every push.
-- **What is not yet proven.** Live RF behaviour on hardware — injection over the air,
-  no-ACK/no-retry on real silicon, sequence ownership, and slot-timing jitter. A concrete
-  **real-world validation protocol (E1–E6)** is specified below; it needs the ath9k/mt76
-  hardware in `HARDWARE_BOM.md`.
-- **Governing hardware caveat.** MediaTek/`mt76` is the modern open OpenWrt platform and
-  supports injection, but it does **not** restore ath9k's register-level MAC-timing
-  control (firmware offload). Modern APs = surrogate-PHY + RX-diversity nodes; reserve
-  ath9k (x86 + AR9280/AR9380) or the SDR path for deterministic slot timing.
+- **Two networks, one command philosophy.** The **802.11** side reuses the existing wheel
+  (mainline Linux + `mac80211` + `ath9k`/`mt76`, OpenWrt, Meneldor on top). The **802.22**
+  side is greenfield **by necessity** — no COTS silicon runs TVWS cognitive-radio OFDMA —
+  so we own PHY, MAC, and management userspace from the SDR up.
+- **Gwaihir (kernel engine).** A Linux kernel module (x86 Ubuntu first, then ARM) that
+  presents the 802.22 MAC as a **netdev** and owns **timing-critical lower-MAC scheduling**
+  (`hrtimer` slots). All higher-level processes flow through this netdev. Heavy IQ/DSP does
+  **not** live in-kernel — it stays in userspace or on the SDR's FPGA.
+- **Substrate abstraction.** Gwaihir talks to the radio through a substrate layer that is
+  location-transparent: local bus (USB/PCIe/GbE) **or SDR-over-TCP**. Per-substrate
+  firmware/gateware and per-arch (x86_64/arm64) module builds are isolated and notated.
+- **Westron (shared config model).** One contract expresses both an 802.11 fleet **and** an
+  802.22 BS/CPE cell (superframe, service flows, sensing, WSDB/GPS). It is the integration
+  seam between the two stacks. Contract + validator live in `westron/`.
+- **Verification carries over.** The Westron validator is gate-able (`--selftest`) and wired
+  into CI exactly like the Monte Carlo campaign, so the config contract can't silently
+  regress.
 
 ---
 
-## Architecture
+## The honest line (kept, per standing approach)
+
+| Layer | 802.11 stack | 802.22 stack | Verdict |
+|---|---|---|---|
+| Host OS + init/scheduler | inherited Linux (Ubuntu x86) | inherited Linux (Ubuntu x86 → ARM) | **Inherit both.** Never rewrite init/kernel-core. |
+| Kernel netdev + timing MAC | `mac80211` (inherited) | **Gwaihir (custom .ko)** | Custom only on the 802.22 side |
+| Lower MAC / firmware | chip firmware (inherited) | **custom MAC** (kernel timing + FPGA/userspace) | Greenfield by necessity |
+| PHY | mt76/ath9k silicon | **custom gateware / soft-PHY on SDR** | Greenfield by necessity |
+| Heavy IQ DSP | n/a | **userspace or FPGA — NOT in kernel** | Deliberate boundary |
+| Management userspace | Meneldor / `radioctl` | Meneldor-shaped, Westron-driven | Shared philosophy |
+
+The novelty budget goes to PHY + MAC + radio-specific userspace. Host-OS plumbing is
+inherited on both sides.
+
+---
+
+## Gwaihir — the kernel engine
+
+**What it is:** a Linux kernel module that (1) registers a **netdev** (`gwa0`, `gwa1`, …)
+so IP/routing/apps flow through it like any interface; (2) runs the **timing-critical
+lower-MAC** (superframe/slot scheduling on `hrtimer`s) where determinism must live; and
+(3) shuttles MPDUs to/from the **PHY** across the substrate layer.
+
+**What it is NOT:** it is not the PHY. IQ sample streaming and OFDMA/sensing DSP run in
+userspace (GNU Radio / C++) or on the SDR's FPGA. Gwaihir hands the PHY scheduled MPDUs
+and timing marks; the PHY hands back demodulated MPDUs. This keeps floating-point DSP out
+of kernel space and lets the same engine drive very different PHY substrates.
+
+**Data flow:**
+```
+apps / IP / routing
+        │  (kernel netdev gwaN)  ← the seam everything flows through
+   ┌────▼─────────────────────────┐
+   │ Gwaihir .ko                   │  netdev + hrtimer slot scheduler (lower MAC timing)
+   │  ├─ MPDU queue / slot map      │
+   │  └─ substrate binding          │
+   └────┬───────────────┬──────────┘
+        │ local bus      │ SDR-over-TCP
+   ┌────▼────┐      ┌────▼─────────┐
+   │ USB/PCIe │      │ TCP transport │   (location-transparent PHY source)
+   └────┬────┘      └────┬─────────┘
+        │                 │
+   ┌────▼─────────────────▼────┐
+   │ PHY: FPGA gateware  OR     │  OFDMA + spectrum sensing (NOT in kernel)
+   │      userspace soft-PHY    │
+   └────────────────────────────┘
+```
+
+**x86 first, ARM next.** Bring-up target is x86 Ubuntu. Because several COTS SDRs embed an
+ARM host (Pluto, USRP E3xx/N3xx, XTRX carriers), the module and its build must be
+arch-portable; ARM builds are isolated per `gwaihir/arch/<arch>/` (see layout).
+
+---
+
+## COTS SDR support matrix
+
+Goal: support the breadth of COTS SDRs. Role is decided by two questions — **can it TX?**
+and **does it cover UHF/VHF TV bands (~54–698 MHz) at ≥6 MHz?** TX-capable + TV-band =
+**BS/CPE** candidate; RX-only = **sensing / incumbent-detection / diversity** node.
+
+### BS / CPE capable (TX, TV-band, ≥6 MHz channel)
+
+| SDR | Transceiver family | Freq range | Max BW | Duplex | Interface | Onboard arch | Notes |
+|---|---|---|---|---|---|---|---|
+| USRP B200 / B210 / B205mini | AD936x | 70 MHz–6 GHz | 56 MHz | full | USB3 | host | Research gold standard |
+| USRP E310/E312/E313/E320 | AD936x | 70 MHz–6 GHz | 56 MHz | full | GbE/embedded | **Zynq ARM+FPGA** | Standalone; ARM substrate |
+| USRP N300/N310/N320 | AD936x | wide | up to 100+ MHz | full | 10GbE | **Zynq ARM+FPGA** | RFNoC; ARM substrate |
+| USRP X310 / X410 | Xilinx/RFSoC | wide | 100+ MHz | full | 10/100GbE | X410 **RFSoC ARM** | High-end |
+| USRP N210 (+WBX/SBX) | daughterboard | DC–6 GHz | 25–50 MHz | full | GbE | host | Legacy but capable |
+| LimeSDR-USB | LMS7002M | 100 kHz–3.8 GHz | 61.44 MHz | full 2×2 | USB3 | host+FPGA | Covers VHF+UHF |
+| LimeSDR Mini 2.0 | LMS7002M | 10 MHz–3.5 GHz | ~30 MHz | full | USB3 | ECP5 FPGA | Compact BS/CPE |
+| Fairwaves XTRX | LMS7002M | 30 MHz–3.8 GHz | ~120 MHz | full | PCIe/M.2 | host varies | Embeddable |
+| bladeRF 2.0 micro xA4/xA9 | AD9361 | 47 MHz–6 GHz | 56 MHz | full 2×2 | USB3 | Cyclone V FPGA | Covers low-VHF (47 MHz) |
+| bladeRF x40 / x115 | LMS6002D | 300 MHz–3.8 GHz | 28 MHz | full | USB3 | FPGA | Legacy; UHF only |
+| Epiq Sidekiq (M.2/PCIe) | AD9361 | 70 MHz–6 GHz | 50+ MHz | full | M.2/PCIe | embedded | Embeddable |
+| ADALM-PLUTO | AD9363 | 325 MHz–3.8 GHz (70 MHz–6 GHz hacked) | 20 MHz | full | USB2 | **Zynq ARM+FPGA** | UHF stock; VHF needs freq-extension; cheap ARM substrate |
+| HackRF One | discrete (MAX2837) | 1 MHz–6 GHz | 20 MHz | **half** | USB2 | host | 8-bit, half-duplex — experiments only (TDD OK) |
+
+### Sensing / RX-only (incumbent detection, RX diversity)
+
+| SDR | Front-end | Freq range | Max BW | Role |
+|---|---|---|---|---|
+| RTL-SDR (RTL2832U+R820T2) | discrete | 24–1766 MHz | ~2.4 MHz | Cheap sensing; <6 MHz so partial-channel only |
+| Airspy R2 / Mini | discrete | 24–1800 MHz | ~10/6 MHz | Sensing |
+| SDRplay RSPdx / RSPduo | discrete | 1 kHz–2 GHz | ~10 MHz | Sensing; RSPduo dual-tuner |
+| KrakenSDR | 5× coherent RTL | 24–1766 MHz | RX | Coherent sensing / direction-finding / diversity |
+
+**Firmware/substrate isolation implied by this matrix:** gateware/PHY forks by
+**transceiver family** (AD936x · LMS7002M · LMS6002D · discrete), the FPGA fabric differs
+per device, and the Gwaihir module forks by **host arch** (x86_64 · arm64). All three axes
+are isolated in the layout below.
+
+---
+
+## SDR-over-TCP transport
+
+The substrate layer makes the PHY source **location-transparent**: Gwaihir binds to a
+substrate descriptor that is either `local` (USB/PCIe/GbE on the same host) or `tcp`
+(a remote SDR host). Established remoting mechanisms this abstracts over: SoapySDR remote
+(`SoapySDRServer`), UHD-over-network, and `rtl_tcp` (RX). Westron expresses this per radio
+as `substrate.transport = { type: local | tcp, host, port }`. Location transparency here
+mirrors the netdev seam: nothing above the substrate layer knows or cares where the radio
+physically is.
+
+---
+
+## Repo layout & notation convention (file isolation)
+
+Everything for the custom stack lives under `thorondor/` and never leaks into the
+802.11 tooling at repo root.
 
 ```
-        your L2 (scheduled MAC / ARQ)  ── 802.22-derived, PHY-agnostic
-                     |
-        +------------+-------------+  netdev seam (TUN/TAP) — planned upper edge
-        |          radioctl        |  HAL: one command surface, N backends
-        |  mock | wifi-overlay | wifi-mac | sdr
-        +----+----------+----------+-------+--+
-             |          |          |       |
-   loopback  |   radio-inject (SEAM #1)    |  radio-phy (SEAM #2, SDR)
-  (airwaves) |   raw 802.11 bcast+NOACK    |  SoapySDR/UHD/GNU Radio
-             |                             |
-        gps / WSDB (SEAM #3, beta) — geolocation gate before any antenna port
+thorondor/
+  README.md                     ← this living doc
+  ARCHITECTURE.md               ← two-stack design doc
+  westron/                      ← shared config model (the contract)
+    westron.schema.json         ← canonical machine-readable contract (JSON Schema)
+    thorondor.example.json      ← reference config: 802.11 fleet + 802.22 BS/CPE
+    validate_westron.py         ← stdlib semantic validator (gate-able: --selftest)
+  gwaihir/                      ← kernel engine (design now; .ko to follow)
+    arch/x86_64/                ← x86 module build (bring-up target)
+    arch/arm64/                 ← ARM module build (Pluto/E3xx/N3xx hosts)
+    substrate/ad936x/           ← per-transceiver-family gateware/driver glue
+    substrate/lms7002m/
+    substrate/discrete/
+    transport/local/            ← USB/PCIe/GbE binding
+    transport/tcp/              ← SDR-over-TCP binding
 ```
 
-- **HAL / backends.** `mock` (no hardware, loopback), `wifi-overlay` (ath10k/LiteBeam
-  class — MAC control *limited*, closed firmware), `wifi-mac` (ath9k class — deeper
-  queue/backoff control), `sdr` (SoapySDR — full MAC/PHY, TVWS-capable). Same verbs for
-  all: `probe / configure / up / down / inject / capture / status`.
-- **Seams.** SEAM #1 `radio-inject` (implemented); SEAM #2 `radio-phy` (SDR streaming
-  stub); SEAM #3 `gps`/white-space-DB (beta, compliance-gating).
-- **Fleet & diversity.** Every radio is a named profile; `fleet-capture` fans a capture
-  across the fleet so each receiver reports independently — the RX-diversity substrate.
+**Notation header** — every file in the custom stack carries a one-line tag so its stack,
+component, arch, and status are self-evident:
+
+```
+// THORONDOR // stack=<802.11|802.22|both> // component=<name> // arch=<x86_64|arm64|any> // substrate=<family|any> // status=<design|draft|accepted>
+```
+
+Use the comment syntax of the file's language (`//`, `#`, `<!-- -->`). CI can grep this tag
+to route lint/build per stack and arch.
 
 ---
 
-## Components
+## Shared config model (Westron)
 
-| File | What it is |
-|---|---|
-| `radioctl.sh` / `radioctl.ps1` | Control-plane CLI (bash / PowerShell), feature-parity |
-| `radio-inject` | Stdlib-only raw 802.11 broadcast injector + monitor RX (SEAM #1) |
-| `radios.conf` | Fleet definition (INI; `[global]` + one `[radio NAME]` per device) |
-| `HARDWARE_BOM.md` | Hardware matrix / BOM (good/better/best, MAC-control caveat per option) |
-| `montecarlo_radio_inject.py` | Property-based Monte Carlo tests for `radio-inject` |
-| `montecarlo_radioctl.sh` / `.ps1` | Randomized scenario tests for the CLIs |
-| `MONTECARLO_REPORT.md` | Full verification report |
-| `ACCEPTANCE_LOG.md` | Acceptance log (BLUF, actions, Q&A ledger, frame anatomy) |
-| `.github/workflows/regression.yml` | Standing regression gate (CI) |
+Westron is the one contract both stacks speak; it is the integration seam. Full contract,
+reference config, and validator are in `westron/`; the model is specified in
+`ARCHITECTURE.md`. Highlights:
 
----
+- One `radios[]` list; each entry declares `stack: 802.11 | 802.22`.
+- 802.11 entries carry the familiar fleet fields (iface, freq, bw, mac).
+- 802.22 entries carry `role: bs | cpe`, `rf` (center/channel-bw/power), `superframe`
+  (frame/superframe/guard timing), `service_flows[]`, `sensing`, and `wsdb` (geolocation
+  gate) — plus a `substrate` block (device family, transport local/tcp, arch).
+- Validation is **semantic**, not just structural: freq-in-band, channel-bw ∈ {6,7,8},
+  superframe = k·frame, guard < frame, unique ids, BS→CPE referential integrity, sensing
+  threshold required when sensing is enabled, geo required when WSDB is enabled, `substrate`
+  required for 802.22.
 
-## Quickstart
-
+Run it:
 ```bash
-# Linux
-bash radioctl.sh --config radios.conf            # interactive REPL
-bash radioctl.sh --config radios.conf doctor     # per-backend dependency check
-python3 radio-inject selftest                    # hardware-free acceptance check
-```
-```powershell
-# Windows
-.\radioctl.ps1 -Config radios.conf
-.\radioctl.ps1 -Config radios.conf doctor
-```
-
-No-hardware smoke test (exercises L2 + RX-diversity with zero radios):
-```
-use sim-a
-up
-inject CAFED00D
-use sim-b
-up
-capture 1              # sim-b hears sim-a on the shared 5200 MHz broadcast domain
-fleet-capture 1        # every radio reports what it independently heard
-```
-
-Live injection on an ath9k/mt76 monitor interface:
-```
-radio-inject tx --iface mon0 --hex <PDU> --broadcast --magic 5241444F -v
-radio-inject rx --iface mon0 --magic 5241444F -v        # on a peer
+python3 thorondor/westron/validate_westron.py thorondor/westron/thorondor.example.json
+python3 thorondor/westron/validate_westron.py --selftest      # gate-able acceptance check
 ```
 
 ---
 
-## Validation — Monte Carlo (software logic)
+## Update policy
 
-Property-based testing: each scenario draws thousands of randomized inputs from the
-realistic input space and asserts an invariant that must hold. Full detail and the
-frame-anatomy table are in `MONTECARLO_REPORT.md`.
+This README is updated whenever a piece of the custom stack is **tested and accepted**.
+Each accepted change appends a row to the Acceptance Ledger with what was verified and how.
 
-| Component | Assertions | Defects | Coverage |
-|---|---:|---:|---|
-| `radio-inject` (Python) | 20,015 | 0 | build/parse round-trip, overlay-magic filter, pcap (DLT 127), sequence trains, strip-FCS, helper fns, edge cases (empty->2304 B, seq wrap, all TX flags) |
-| `radioctl.sh` (bash) | 750 | 0 | resolution precedence, per-backend freq gating, mock broadcast-domain loopback, dispatch robustness, fleet enumeration |
-| `radioctl.ps1` (PowerShell) | parity | — | not executed in authoring env; 29/29 backend fns + identical command surface; run `montecarlo_radioctl.ps1` on Windows |
+## Acceptance Ledger
 
-Reproduce:
-```bash
-python3 montecarlo_radio_inject.py 20000 0xC0FFEE   # RESULT: PASS
-bash    montecarlo_radioctl.sh 150                   # RESULT: PASS
-```
-```powershell
-pwsh -File montecarlo_radioctl.ps1 -Runs 2000        # run on Windows
-```
-
-**Scope of this tier:** proves the software (framing, sequencing, config resolution,
-frequency gating, loopback) is defect-free. It does **not** test live RF — that is the
-next tier, below.
-
----
-
-## Real-world radio validation (experiment protocol)
-
-The Monte Carlo tier proves the *code*; this tier proves the *approach on silicon*. Each
-experiment has a hypothesis, a setup using `radioctl` + `radio-inject`, a metric, and an
-acceptance threshold. Run in a shielded/confined space; for any TVWS antenna port, wire
-SEAM #3 (geolocation -> white-space-DB) first.
-
-Recommended minimum rig: two nodes of the same chipset (start with **ath9k**, then repeat
-on **mt76**) as `wifi-mac` backends, plus a third node in monitor as an independent
-observer. Tag all frames with a magic (`--magic 5241444F`) so RX filters overlay traffic
-from ambient Wi-Fi.
-
-### E1 — Injection reachability (baseline)
-- **Hypothesis.** `radio-inject` broadcast frames are received over the air and survive the magic filter.
-- **Setup.** Node A `wifi-mac` up on channel X; Node B monitor on X.
-- **Procedure.** `radio-inject tx --iface monA --hex <PDU> --broadcast --magic 5241444F --count 1000 --interval 0.01`; on B `radio-inject rx --iface monB --magic 5241444F --pcap b.pcap`.
-- **Metric.** Frame delivery ratio (received/1000) vs attenuation (step attenuator or distance).
-- **Accept.** >=99% at low attenuation; monotonic, graceful roll-off as attenuation rises.
-
-### E2 — No-ACK / no-retry confirmation
-- **Hypothesis.** Broadcast + radiotap NOACK means the hardware neither ACKs nor retries; your ARQ is the only reliability layer.
-- **Setup.** Observer node in monitor capturing A's transmissions.
-- **Procedure.** Inject a known count; in the observer pcap, count retransmissions (retry bit / duplicate seq) and any ACK frames addressed to A.
-- **Metric.** Retry count and ACK count attributable to injected frames.
-- **Accept.** 0 hardware retries and 0 ACKs for injected broadcast frames.
-
-### E3 — Sequence ownership (the mt76-vs-ath9k differentiator)
-- **Hypothesis.** With NOSEQ the injected 802.11 sequence numbers survive to the air; without it (or on firmware that overrides), they don't.
-- **Setup.** A injects a known ascending seq train; observer captures.
-- **Procedure.** `tx --seq 100 --count 500` with `--overwrite-seq` off, then repeat with it on; compare captured seq fields to injected.
-- **Metric.** Sequence-preservation rate (captured seq == injected seq).
-- **Accept.** ath9k ~100% preserved with NOSEQ; **record** the mt76 rate — a low rate quantifies the BOM's MAC-control caveat and tells you whether slot ordering can live in the 802.11 seq field on that platform.
-
-### E4 — Slot-timing jitter (load-bearing for the scheduled MAC)
-- **Hypothesis.** The platform can hold inter-frame timing tight enough for slot boundaries.
-- **Setup.** A injects at a target interval; timestamp source = observer radiotap TSFT (or an SDR/scope on the band for ground truth).
-- **Procedure.** `tx --count 5000 --interval <T>` for several T (e.g. 1 ms, 5 ms, 20 ms); measure actual inter-frame gaps. Compare userspace-only, an `hrtimer` kernel path, and (later) an in-driver scheduler.
-- **Metric.** Jitter = standard deviation of inter-frame gap; also worst-case deviation.
-- **Accept.** Jitter <= a set fraction (e.g. <=10%) of your intended slot guard time. This experiment decides whether a given host/radio can carry your scheduled MAC at all — it is the real acceptance test for slot timing, and where MIPS consumer APs are expected to fail and x86 + ath9k to pass.
-
-### E5 — RX diversity gain (validates the fleet premise)
-- **Hypothesis.** Multiple independent receivers raise combined delivery ratio over the best single receiver.
-- **Setup.** A injects; N observer nodes (`fleet-capture`) capture simultaneously, physically separated.
-- **Procedure.** `fleet-capture` (or per-node `radio-inject rx --pcap`) during an injection run at moderate attenuation; compute per-node and selection-combined delivery ratios offline.
-- **Metric.** Diversity gain = combined DR - best single-node DR.
-- **Accept.** Combined DR >= best single DR; gain grows with node separation. Confirms `fleet-capture` is a real diversity substrate, not just parallel logging.
-
-### E6 — Surrogate->hardware parity (validates surrogate-first)
-- **Hypothesis.** A scenario that passes in the `mock` backend predicts L2 behaviour on hardware.
-- **Setup.** The same scenario script (inject sequence, expected RX set) run against `mock` and against `wifi-mac` hardware.
-- **Procedure.** Diff the L2-visible outcome (frame counts, ordering, magic-filtered RX set) between mock and hardware.
-- **Metric.** Behavioural delta at the L2 boundary (should be zero for framing/ordering; RF loss shows only as delivery ratio, not logic divergence).
-- **Accept.** No L2-logic divergence between surrogate and hardware; differences confined to RF delivery ratio. This is what justifies developing against `mock` in CI.
-
-**Recording.** Archive every run's pcaps (`--pcap`) and append results to `ACCEPTANCE_LOG.md`
-so the hardware tier accumulates the same audit trail as the software tier.
-
----
-
-## Hardware
-
-Summary; full matrix with the MAC-control caveat per option in `HARDWARE_BOM.md`.
-
-- **Top two modded APs:** OpenWrt One (MT7981B, ~$89, unbrickable reference board) and
-  GL.iNet Flint 2 (MT7981B, ~$150, more headroom). Both `mt76`, both run `radio-inject`.
-- **Max MAC control:** x86 host + ath9k card (AR9280/AR9380) — still the pick for
-  deterministic slot timing despite being 802.11n.
-- **RX-diversity nodes:** several Alfa AWUS036ACM (MT7612U) across one host.
-- Avoid Broadcom for Wi-Fi under OpenWrt; verify exact hardware revision on the OpenWrt
-  Table of Hardware before buying.
-
----
-
-## CI — standing regression gate
-
-`.github/workflows/regression.yml` runs on every push/PR/dispatch:
-
-- **linux** (ubuntu-latest): `radio-inject selftest`, `montecarlo_radio_inject.py`,
-  `montecarlo_radioctl.sh`, plus informational shellcheck.
-- **windows** (windows-latest): `radioctl.ps1 doctor` smoke + `montecarlo_radioctl.ps1`.
-- **gate**: green only if both matrices pass.
-
-Assumes files at repo root; adjust paths if nested. This turns the Monte Carlo campaign
-into a merge gate so no change can regress the verified logic.
-
----
-
-## Roadmap / open decisions
-
-1. **Testbed layer** (next): drive traffic at `radio-inject`'s frame layer (buildable
-   now) vs at the TUN/TAP netdev (runs your real MAC/ARQ in the loop; needs the netdev
-   seam first).
-2. **Netdev seam**: TUN/TAP upper edge so surrogate-PHY and SDR-PHY are drop-in
-   interchangeable under one L2.
-3. **SEAM #2 `radio-phy`**: SDR TX/RX bridge for the real TVWS PHY.
-4. **SEAM #3 `gps`/WSDB**: geolocation gate before any antenna port (beta).
-
----
-
-## Compliance
-
-`radio-inject` prints a compliance banner on live transmit: emission must be within
-authorized/confined spectrum, and TVWS operation is geolocation/WSDB-gated (SEAM #3)
-before any antenna port. The tool does not hard-block (shielded-lab use is the intended
-path) but the reminder is always emitted. This project takes the operator's stated
-confinement/authorization at face value; lawful operation is the operator's responsibility.
-
----
-
-_Naming is functional; rename freely to fit your conventions. Last updated: this session._
+| Date | Component | Change | Verification | Status |
+|---|---|---|---|---|
+| this session | Westron config model | v0.1 contract (schema + semantic validator + reference config spanning both stacks) | `validate_westron.py --selftest` (valid/invalid fixtures) + validation of `thorondor.example.json` | **accepted** |
+| this session | Two-stack architecture | `ARCHITECTURE.md` design doc (netdev seam, inherited-vs-custom, 802.22 decomposition) | design review (no executable artifact) | accepted (design) |
+| this session | Gwaihir engine | design + layout + SDR/substrate/arch isolation; `.ko` not yet implemented | design review | design |
