@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+# -----------------------------------------------------------------------------
+# radio-inject — SEAM #1 concrete implementation for radioctl.
+#
+# Raw 802.11 broadcast injector + monitor-mode receiver for the L2.5 overlay
+# path (wifi-overlay / wifi-mac backends). Deliberately STDLIB-ONLY (socket,
+# struct) — no scapy — so the frame construction is fully auditable and the
+# tool has a minimal supply chain, which matters for a critical acceptance tool.
+#
+# What it does, and why each choice is made:
+#   * Frames are 802.11 DATA frames with a BROADCAST receiver address
+#     (ff:ff:ff:ff:ff:ff). 802.11 hardware does NOT auto-ACK broadcast frames,
+#     so the NIC's lower MAC does not inject its own reliability layer — your
+#     L2 ARQ/HARQ owns reliability. This is the core "custom-MAC-over-WiFi" trick.
+#   * A radiotap header is prepended with TX_FLAGS = NOACK (+ NOSEQ by default).
+#     NOACK tells the driver not to expect/await an ACK or retry. NOSEQ tells it
+#     NOT to overwrite the 802.11 sequence number, so YOUR L2 owns ordering.
+#   * TX/RX use AF_PACKET SOCK_RAW on a monitor interface (Linux). That is the
+#     same mechanism aircrack/scapy use underneath; doing it directly keeps the
+#     bytes on the wire legible and dependency-free.
+#   * No FCS is appended by this tool — mac80211 computes the FCS on injection.
+#
+# Platform: the RF tx/rx paths require Linux (AF_PACKET). Frame build/parse,
+# selftest, and pcap dump are pure and run anywhere (Windows operators can
+# validate frame construction offline; drive the Linux radio host over SSH).
+#
+# Subcommands:
+#   tx         inject frame(s) on a monitor interface
+#   rx         sniff frames on a monitor interface
+#   selftest   build+parse+pcap round-trip with NO hardware (acceptance check)
+#   pcap-dump  read back a .pcap and print frames (offline inspection)
+#
+# Exit codes: 0 ok; 1 runtime/hardware error; 2 usage; 3 selftest FAILED.
+#
+# Parsing scope (reviewed): parse_frame is tuned for the frames this tool injects
+# — a 3-address, non-QoS DATA frame (24-byte MAC header) with a 10-byte radiotap
+# header whose only present field is TX_FLAGS. The 802.11 addresses/seq are read
+# from the radiotap-declared offset (rtlen), so they parse correctly regardless of
+# radiotap contents; but on RX of *foreign* frames, (a) TX_FLAGS is decoded only if
+# that present bit is set and is assumed at the fixed offset, and (b) QoS (26-byte
+# header) or 4-address frames will misalign the body by 2/6 bytes. For our own
+# injected traffic and for magic-tagged overlay RX this is exact; a full radiotap
+# parser is intentionally out of scope. FCS is never appended on TX (mac80211
+# computes it); use --strip-fcs on RX if the driver reports a trailing FCS.
+# -----------------------------------------------------------------------------
+import argparse
+import binascii
+import socket
+import struct
+import sys
+import time
+
+VERSION = "0.1.0"
+
+HAVE_AF_PACKET = hasattr(socket, "AF_PACKET")
+ETH_P_ALL = 0x0003
+DLT_IEEE802_11_RADIOTAP = 127
+BROADCAST = "ff:ff:ff:ff:ff:ff"
+
+# radiotap "present" bitmap: bit 15 == TX_FLAGS field present
+RT_PRESENT_TX_FLAGS = 1 << 15
+# IEEE80211_RADIOTAP_TX_FLAGS bit values
+TX_FLAGS = {
+    "fail":  0x0001,   # transmission failed (RX side indicator)
+    "cts":   0x0002,   # used cts-to-self protection
+    "rts":   0x0004,   # used rts/cts handshake
+    "noack": 0x0008,   # do not expect/await an ACK; no hardware retries
+    "noseq": 0x0010,   # do NOT overwrite the sequence number (L2 owns it)
+}
+
+# ---------------------------------------------------------------------------
+# byte helpers
+# ---------------------------------------------------------------------------
+def mac2bytes(m):
+    parts = m.split(":")
+    if len(parts) != 6:
+        raise ValueError("bad MAC: %r" % m)
+    return bytes(int(x, 16) for x in parts)
+
+def bytes2mac(b):
+    return ":".join("%02x" % x for x in b)
+
+def hexdump(data, width=16, indent="    "):
+    out = []
+    for off in range(0, len(data), width):
+        chunk = data[off:off + width]
+        hexs = " ".join("%02x" % c for c in chunk)
+        text = "".join(chr(c) if 32 <= c < 127 else "." for c in chunk)
+        out.append("%s%04x  %-*s  %s" % (indent, off, width * 3 - 1, hexs, text))
+    return "\n".join(out) if out else indent + "(empty)"
+
+# ---------------------------------------------------------------------------
+# frame construction / parsing  (pure — testable with no hardware)
+# ---------------------------------------------------------------------------
+def build_radiotap(txflags):
+    """10-byte radiotap header carrying only the TX_FLAGS field."""
+    present = RT_PRESENT_TX_FLAGS
+    hdr_len = 10                                 # 8-byte base + 2-byte TX_FLAGS
+    return struct.pack("<BBHI", 0, 0, hdr_len, present) + struct.pack("<H", txflags)
+
+def build_dot11_data(src, dst, bssid, seq, body):
+    """Minimal 802.11 DATA frame (toDS=fromDS=0): addr1=DA addr2=SA addr3=BSSID."""
+    fc_type = 2       # data
+    fc_subtype = 0    # data (not QoS)
+    fc0 = (fc_subtype << 4) | (fc_type << 2)     # protocol version 0
+    fc1 = 0                                       # no toDS/fromDS/retry/etc.
+    duration = 0
+    seqctl = (seq & 0x0FFF) << 4                  # fragment number 0
+    return (struct.pack("<BBH", fc0, fc1, duration)
+            + mac2bytes(dst) + mac2bytes(src) + mac2bytes(bssid)
+            + struct.pack("<H", seqctl) + body)
+
+def build_frame(src, dst, bssid, seq, body, txflags):
+    return build_radiotap(txflags) + build_dot11_data(src, dst, bssid, seq, body)
+
+def txflags_names(txflags):
+    return "+".join(n for n, v in TX_FLAGS.items() if txflags & v) or "none"
+
+def parse_frame(buf, strip_fcs=False):
+    """Parse radiotap + 802.11 DATA. Returns a dict of fields + body."""
+    if len(buf) < 4:
+        raise ValueError("short frame (%d bytes)" % len(buf))
+    ver, pad, rtlen = struct.unpack_from("<BBH", buf, 0)
+    if rtlen > len(buf) or rtlen < 8:
+        raise ValueError("bad radiotap length %d" % rtlen)
+    present, = struct.unpack_from("<I", buf, 4)
+    txflags = None
+    if present & RT_PRESENT_TX_FLAGS and rtlen >= 10:
+        txflags, = struct.unpack_from("<H", buf, 8)
+    dot11 = buf[rtlen:]
+    if len(dot11) < 24:
+        raise ValueError("short 802.11 header (%d bytes)" % len(dot11))
+    fc0, fc1, duration = struct.unpack_from("<BBH", dot11, 0)
+    dst = bytes2mac(dot11[4:10]); src = bytes2mac(dot11[10:16]); bssid = bytes2mac(dot11[16:22])
+    seqctl, = struct.unpack_from("<H", dot11, 22)
+    body = dot11[24:]
+    if strip_fcs and len(body) >= 4:
+        body = body[:-4]
+    return {
+        "rtlen": rtlen, "present": present, "txflags": txflags,
+        "fc_type": (fc0 >> 2) & 0x3, "fc_subtype": (fc0 >> 4) & 0xF,
+        "dst": dst, "src": src, "bssid": bssid, "seq": seqctl >> 4, "body": body,
+    }
+
+# ---------------------------------------------------------------------------
+# pcap (DLT 127 = radiotap) — pure, for offline inspection / acceptance
+# ---------------------------------------------------------------------------
+def pcap_write(path, frames):
+    with open(path, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, DLT_IEEE802_11_RADIOTAP))
+        for ts, data in frames:
+            sec = int(ts); usec = int((ts - sec) * 1e6)
+            f.write(struct.pack("<IIII", sec, usec, len(data), len(data)))
+            f.write(data)
+
+def pcap_read(path):
+    out = []
+    with open(path, "rb") as f:
+        gh = f.read(24)
+        if len(gh) < 24:
+            raise ValueError("truncated pcap header")
+        magic, = struct.unpack_from("<I", gh, 0)
+        if magic != 0xa1b2c3d4:
+            raise ValueError("unexpected pcap magic 0x%08x (only little-endian usec pcap supported)" % magic)
+        while True:
+            rh = f.read(16)
+            if len(rh) < 16:
+                break
+            sec, usec, incl, orig = struct.unpack("<IIII", rh)
+            data = f.read(incl)
+            if len(data) < incl:
+                break
+            out.append((sec + usec / 1e6, data))
+    return out
+
+# ---------------------------------------------------------------------------
+# sockets (Linux AF_PACKET)
+# ---------------------------------------------------------------------------
+def _require_af_packet():
+    if not HAVE_AF_PACKET:
+        raise RuntimeError(
+            "raw 802.11 tx/rx requires Linux (AF_PACKET). On this platform use "
+            "'selftest'/'pcap-dump' offline, or run radio-inject on the Linux radio host.")
+
+def open_tx(iface):
+    _require_af_packet()
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+    s.bind((iface, 0))
+    return s
+
+def open_rx(iface):
+    _require_af_packet()
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
+    s.bind((iface, 0))
+    return s
+
+# ---------------------------------------------------------------------------
+# body resolution
+# ---------------------------------------------------------------------------
+def resolve_body(args):
+    if args.hex is not None:
+        return binascii.unhexlify(args.hex.replace(" ", ""))
+    if args.file is not None:
+        with open(args.file, "rb") as f:
+            return f.read()
+    if args.stdin:
+        return sys.stdin.buffer.read()
+    raise SystemExit("tx: need a payload — one of --hex, --file, or --stdin")
+
+def compliance_banner():
+    sys.stderr.write(
+        "\033[33m[compliance] live RF emission. Confirm you are within authorized/"
+        "confined spectrum;\n            TVWS operation is geolocation/WSDB-gated "
+        "(radioctl SEAM #3) before any antenna port.\033[0m\n")
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+def cmd_tx(args):
+    body = resolve_body(args)
+    if args.magic:
+        body = binascii.unhexlify(args.magic.replace(" ", "")) + body
+
+    dst = args.dst if args.dst else BROADCAST
+    is_bcast = (dst.lower() == BROADCAST)
+
+    txflags = 0
+    if args.no_ack or is_bcast:
+        txflags |= TX_FLAGS["noack"]
+    if not args.overwrite_seq:
+        txflags |= TX_FLAGS["noseq"]
+
+    frames_for_pcap = []
+    sock = None
+    if not args.dry_run:
+        sock = open_tx(args.iface)
+        compliance_banner()
+
+    sent = 0
+    for i in range(args.count):
+        seq = (args.seq + i) & 0x0FFF
+        frame = build_frame(args.src, dst, args.bssid, seq, body, txflags)
+        if args.verbose or args.dry_run:
+            print("frame #%d  dst=%s src=%s bssid=%s seq=%d txflags=%s len=%d"
+                  % (i, dst, args.src, args.bssid, seq, txflags_names(txflags), len(frame)))
+            if args.verbose:
+                print(hexdump(frame))
+        if args.pcap is not None:
+            frames_for_pcap.append((time.time(), frame))
+        if sock is not None:
+            sock.send(frame)
+            sent += 1
+        if args.interval and i < args.count - 1:
+            time.sleep(args.interval)
+
+    if args.pcap is not None:
+        pcap_write(args.pcap, frames_for_pcap)
+        print("wrote %d frame(s) to %s (DLT 127, open in wireshark)" % (len(frames_for_pcap), args.pcap))
+    if sock is not None:
+        sock.close()
+        print("transmitted %d frame(s) on %s" % (sent, args.iface))
+    elif args.pcap is None:
+        print("dry-run: built %d frame(s), nothing transmitted" % args.count)
+    return 0
+
+def cmd_rx(args):
+    sock = open_rx(args.iface)
+    if args.timeout:
+        sock.settimeout(args.timeout)
+    magic = binascii.unhexlify(args.magic.replace(" ", "")) if args.magic else None
+    captured = []
+    n = 0
+    print("listening on %s (count=%s timeout=%ss magic=%s) ..."
+          % (args.iface, args.count or "inf", args.timeout, args.magic or "-"))
+    try:
+        while args.count == 0 or n < args.count:
+            try:
+                data = sock.recv(4096)
+            except socket.timeout:
+                print("(timeout)")
+                break
+            try:
+                p = parse_frame(data, strip_fcs=args.strip_fcs)
+            except ValueError:
+                continue
+            if magic and not p["body"].startswith(magic):
+                continue
+            print("rx  dst=%s src=%s bssid=%s seq=%d type=%d/%d txflags=%s bodylen=%d"
+                  % (p["dst"], p["src"], p["bssid"], p["seq"], p["fc_type"], p["fc_subtype"],
+                     txflags_names(p["txflags"] or 0), len(p["body"])))
+            if args.verbose:
+                print(hexdump(p["body"]))
+            if args.pcap is not None:
+                captured.append((time.time(), data))
+            n += 1
+    except KeyboardInterrupt:
+        print("\ninterrupted")
+    finally:
+        sock.close()
+    if args.pcap is not None:
+        pcap_write(args.pcap, captured)
+        print("wrote %d captured frame(s) to %s" % (len(captured), args.pcap))
+    return 0
+
+def cmd_pcap_dump(args):
+    frames = pcap_read(args.pcap)
+    print("%s: %d frame(s)" % (args.pcap, len(frames)))
+    for i, (ts, data) in enumerate(frames):
+        try:
+            p = parse_frame(data, strip_fcs=args.strip_fcs)
+            print("#%d t=%.6f  dst=%s src=%s bssid=%s seq=%d txflags=%s bodylen=%d"
+                  % (i, ts, p["dst"], p["src"], p["bssid"], p["seq"],
+                     txflags_names(p["txflags"] or 0), len(p["body"])))
+            if args.verbose:
+                print(hexdump(p["body"]))
+        except ValueError as e:
+            print("#%d  unparseable: %s" % (i, e))
+    return 0
+
+def cmd_selftest(args):
+    """Hardware-free acceptance check. Exercises the exact build/parse used on air."""
+    import os
+    import tempfile
+    fails = []
+    def check(name, cond):
+        print("  [%s] %s" % ("PASS" if cond else "FAIL", name))
+        if not cond:
+            fails.append(name)
+
+    print("radio-inject selftest v%s" % VERSION)
+    print("-- frame build/parse round-trip --")
+    src, bssid = "02:00:00:00:00:01", "02:00:00:00:00:ff"
+    payloads = [b"", b"A", b"\x00\x01\x02\x03hello-L2.5", bytes(range(64))]
+    for i, body in enumerate(payloads):
+        txf = TX_FLAGS["noack"] | TX_FLAGS["noseq"]
+        frame = build_frame(src, BROADCAST, bssid, seq=i, body=body, txflags=txf)
+        p = parse_frame(frame)
+        check("payload#%d body preserved" % i, p["body"] == body)
+        check("payload#%d dst is broadcast" % i, p["dst"] == BROADCAST)
+        check("payload#%d src preserved" % i, p["src"] == src)
+        check("payload#%d seq preserved" % i, p["seq"] == i)
+        check("payload#%d is DATA frame (type 2)" % i, p["fc_type"] == 2)
+        check("payload#%d NOACK set" % i, bool(p["txflags"] & TX_FLAGS["noack"]))
+        check("payload#%d NOSEQ set" % i, bool(p["txflags"] & TX_FLAGS["noseq"]))
+        check("payload#%d radiotap len == 10" % i, p["rtlen"] == 10)
+
+    print("-- pcap round-trip (DLT 127) --")
+    fd, path = tempfile.mkstemp(suffix=".pcap"); os.close(fd)
+    try:
+        built = [(time.time(), build_frame(src, BROADCAST, bssid, seq=k, body=b"pcap-%d" % k,
+                                            txflags=TX_FLAGS["noack"] | TX_FLAGS["noseq"]))
+                 for k in range(3)]
+        pcap_write(path, built)
+        back = pcap_read(path)
+        check("pcap frame count", len(back) == 3)
+        ok_bodies = all(parse_frame(back[k][1])["body"] == b"pcap-%d" % k for k in range(3))
+        check("pcap bodies preserved", ok_bodies)
+    finally:
+        os.remove(path)
+
+    print("-- platform --")
+    print("  AF_PACKET (live tx/rx) available: %s" % HAVE_AF_PACKET)
+
+    if fails:
+        print("\nSELFTEST FAILED: %d check(s): %s" % (len(fails), ", ".join(fails)))
+        return 3
+    print("\nSELFTEST PASSED")
+    return 0
+
+# ---------------------------------------------------------------------------
+# argument parsing
+# ---------------------------------------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(prog="radio-inject",
+        description="stdlib-only raw 802.11 broadcast injector + monitor RX (radioctl SEAM #1)")
+    p.add_argument("--version", action="version", version="radio-inject " + VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    tx = sub.add_parser("tx", help="inject frame(s) on a monitor interface")
+    tx.add_argument("--iface", required=True, help="monitor-mode interface (e.g. mon0)")
+    g = tx.add_mutually_exclusive_group()
+    g.add_argument("--hex", help="payload as hex string")
+    g.add_argument("--file", help="payload from file")
+    g.add_argument("--stdin", action="store_true", help="payload from stdin")
+    tx.add_argument("--broadcast", action="store_true", help="receiver = ff:ff:ff:ff:ff:ff (default if no --dst)")
+    tx.add_argument("--dst", help="explicit receiver MAC (unicast experiments)")
+    tx.add_argument("--src", default="02:00:00:00:00:01", help="source MAC (addr2)")
+    tx.add_argument("--bssid", default="02:00:00:00:00:ff", help="BSSID (addr3)")
+    tx.add_argument("--no-ack", action="store_true", help="set radiotap NOACK (auto-on for broadcast)")
+    tx.add_argument("--overwrite-seq", action="store_true", help="let the driver assign the seq number (clears NOSEQ)")
+    tx.add_argument("--seq", type=int, default=0, help="starting 802.11 sequence number")
+    tx.add_argument("--magic", help="hex prefix prepended to the body (overlay tag for RX filtering)")
+    tx.add_argument("--count", type=int, default=1, help="number of frames to send")
+    tx.add_argument("--interval", type=float, default=0.0, help="inter-frame delay seconds (float)")
+    tx.add_argument("--pcap", help="also write sent frame(s) to this pcap (DLT 127)")
+    tx.add_argument("--dry-run", action="store_true", help="build (and optionally pcap) but do NOT transmit")
+    tx.add_argument("--verbose", "-v", action="store_true", help="hexdump each frame")
+    tx.set_defaults(func=cmd_tx)
+
+    rx = sub.add_parser("rx", help="sniff frames on a monitor interface")
+    rx.add_argument("--iface", required=True, help="monitor-mode interface")
+    rx.add_argument("--count", type=int, default=0, help="stop after N frames (0 = infinite)")
+    rx.add_argument("--timeout", type=float, default=0.0, help="socket timeout seconds (0 = none)")
+    rx.add_argument("--magic", help="only show frames whose body starts with this hex prefix")
+    rx.add_argument("--strip-fcs", action="store_true", help="drop trailing 4-byte FCS from body")
+    rx.add_argument("--pcap", help="write captured frame(s) to this pcap (DLT 127)")
+    rx.add_argument("--verbose", "-v", action="store_true", help="hexdump each body")
+    rx.set_defaults(func=cmd_rx)
+
+    pd = sub.add_parser("pcap-dump", help="read back a pcap and print frames (offline)")
+    pd.add_argument("--pcap", required=True, help="pcap file to read")
+    pd.add_argument("--strip-fcs", action="store_true", help="drop trailing 4-byte FCS from body")
+    pd.add_argument("--verbose", "-v", action="store_true", help="hexdump each body")
+    pd.set_defaults(func=cmd_pcap_dump)
+
+    st = sub.add_parser("selftest", help="hardware-free build/parse/pcap acceptance check")
+    st.set_defaults(func=cmd_selftest)
+
+    return p
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except (RuntimeError, OSError, ValueError) as e:
+        sys.stderr.write("error: %s\n" % e)
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
