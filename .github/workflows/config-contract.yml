@@ -1,1 +1,50 @@
+# THORONDOR // component=westron-ci // stack=both // status=draft
+# Standing gate for the Westron shared config contract (custom stack).
+# Isolated from the 802.11 regression gate (regression.yml) on purpose.
+# Assumes files under thorondor/westron/ ; adjust paths if you relocate them.
 
+name: config-contract
+
+on:
+  push:
+    branches: [ "**" ]
+    paths:
+      - "thorondor/westron/**"
+      - ".github/workflows/config-contract.yml"
+  pull_request:
+    paths:
+      - "thorondor/westron/**"
+      - ".github/workflows/config-contract.yml"
+  workflow_dispatch:
+
+jobs:
+  westron:
+    name: validate Westron contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Contract fixture battery (valid + invalid)
+        run: python3 thorondor/westron/validate_westron.py --selftest
+
+      - name: Validate reference config
+        run: python3 thorondor/westron/validate_westron.py thorondor/westron/thorondor.example.json
+
+      - name: Validate any additional *.config.json under westron/
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in thorondor/westron/*.config.json; do
+            found=1
+            echo "validating $f"
+            python3 thorondor/westron/validate_westron.py "$f"
+          done
+          [ "$found" -eq 0 ] && echo "no extra *.config.json files (ok)" || true
+
+      - name: Schema is well-formed JSON
+        run: python3 -c "import json,sys; json.load(open('thorondor/westron/westron.schema.json')); print('schema OK')"
