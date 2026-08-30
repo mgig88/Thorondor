@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "name": "thorondor-ref-deployment",
+  "geo": { "lat": 37.42, "lon": -78.65, "uncertainty_m": 50 },
+  "defaults": { "notation": "THORONDOR // component=westron-example // stack=both // status=draft" },
+  "radios": [
+    {
+      "id": "wifi-1",
+      "stack": "802.11",
+      "netdev": "wlan0",
+      "iface": "wlan0",
+      "rf": { "freq_mhz": 5180, "bw_mhz": 20 },
+      "mac": { "mode": "scheduled" },
+      "txpower_dbm": 15
+    },
+    {
+      "id": "bs-1",
+      "stack": "802.22",
+      "role": "bs",
+      "netdev": "gwa0",
+      "substrate": {
+        "device": "usrp",
+        "driver_args": "type=b200",
+        "arch": "x86_64",
+        "transport": { "type": "local" }
+      },
+      "rf": { "center_mhz": 605, "channel_bw_mhz": 6, "tx_power_dbm": 30 },
+      "superframe": { "frame_ms": 10, "superframe_ms": 160, "guard_us": 200 },
+      "service_flows": [
+        { "id": "sf-mgmt", "direction": "bidir", "qos": "ugs", "rate_kbps": 64 },
+        { "id": "sf-data-down", "direction": "down", "qos": "nrtps", "rate_kbps": 8000 }
+      ],
+      "sensing": {
+        "enabled": true,
+        "quiet_period_ms": 2,
+        "threshold_dbm": -114,
+        "incumbents": ["atsc", "wireless-mic"]
+      },
+      "wsdb": {
+        "enabled": true,
+        "db_url": "https://wsdb.example/query",
+        "geo": { "lat": 37.42, "lon": -78.65, "uncertainty_m": 50 }
+      },
+      "cpes": ["cpe-1"]
+    },
+    {
+      "id": "cpe-1",
+      "stack": "802.22",
+      "role": "cpe",
+      "netdev": "gwa1",
+      "serving_bs": "bs-1",
+      "substrate": {
+        "device": "pluto",
+        "driver_args": "uri=ip:pluto.local",
+        "arch": "arm64",
+        "transport": { "type": "tcp", "host": "10.0.0.7", "port": 30000 }
+      },
+      "rf": { "center_mhz": 605, "channel_bw_mhz": 6, "tx_power_dbm": 20 },
+      "superframe": { "frame_ms": 10, "superframe_ms": 160, "guard_us": 200 },
+      "service_flows": [
+        { "id": "sf-uplink", "direction": "up", "qos": "rtps", "rate_kbps": 4000 }
+      ],
+      "sensing": {
+        "enabled": true,
+        "quiet_period_ms": 2,
+        "threshold_dbm": -114,
+        "incumbents": ["atsc"]
+      },
+      "wsdb": { "enabled": false }
+    }
+  ]
+}
