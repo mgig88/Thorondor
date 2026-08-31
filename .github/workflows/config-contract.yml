@@ -1,7 +1,13 @@
 # THORONDOR // component=westron-ci // stack=both // status=draft
 # Standing gate for the Westron shared config contract (custom stack).
 # Isolated from the 802.11 regression gate (regression.yml) on purpose.
-# Assumes files under thorondor/westron/ ; adjust paths if you relocate them.
+#
+# Finalized layout (this workflow depends on it):
+#   - Contract + validator + reference config live in Westron/ (repo root).
+#   - thorondor.example.json stays in Westron/ (cohesion with its schema/validator).
+#   - Two-stack design (ARCHITECTURE.md) lives at the repo root.
+#   - THIS FILE MUST live in .github/workflows/ — GitHub only runs workflows there.
+# Adjust the paths below only if you deliberately relocate the Westron/ files.
 
 name: config-contract
 
@@ -9,11 +15,11 @@ on:
   push:
     branches: [ "**" ]
     paths:
-      - "thorondor/westron/**"
+      - "Westron/**"
       - ".github/workflows/config-contract.yml"
   pull_request:
     paths:
-      - "thorondor/westron/**"
+      - "Westron/**"
       - ".github/workflows/config-contract.yml"
   workflow_dispatch:
 
@@ -30,21 +36,26 @@ jobs:
           python-version: "3.x"
 
       - name: Contract fixture battery (valid + invalid)
-        run: python3 thorondor/westron/validate_westron.py --selftest
+        run: python3 Westron/validate_westron.py --selftest
+
+      - name: Reference config must exist (guard against silent drift)
+        run: |
+          test -f Westron/thorondor.example.json \
+            || { echo "::error::reference config missing — did it move or get renamed?"; exit 1; }
 
       - name: Validate reference config
-        run: python3 thorondor/westron/validate_westron.py thorondor/westron/thorondor.example.json
+        run: python3 Westron/validate_westron.py Westron/thorondor.example.json
 
-      - name: Validate any additional *.config.json under westron/
+      - name: Validate any additional *.config.json under Westron/
         run: |
           shopt -s nullglob
           found=0
-          for f in thorondor/westron/*.config.json; do
+          for f in Westron/*.config.json; do
             found=1
             echo "validating $f"
-            python3 thorondor/westron/validate_westron.py "$f"
+            python3 Westron/validate_westron.py "$f"
           done
           [ "$found" -eq 0 ] && echo "no extra *.config.json files (ok)" || true
 
       - name: Schema is well-formed JSON
-        run: python3 -c "import json,sys; json.load(open('thorondor/westron/westron.schema.json')); print('schema OK')"
+        run: python3 -c "import json,sys; json.load(open('Westron/westron.schema.json')); print('schema OK')"

@@ -1,14 +1,23 @@
 name: regression-gate
 
-# Standing regression gate for the radioctl / radio-inject stack.
-# Re-runs the full Monte Carlo verification campaign on every push and PR.
-# Assumes the project files live at the repository root; adjust paths if you
-# nest them under a subdirectory.
+# Standing regression gate for the Meneldor tooling (radioctl / radio-inject).
+# Re-runs the full Monte Carlo verification campaign.
+#
+# Meneldor lives at Meneldor/ in the repo root. The test harnesses resolve their
+# targets relative to their own location, so paths below just need the prefix.
+# Path-filtered so this gate fires on Meneldor changes (mirrors config-contract.yml).
+# Remove the paths: filters if you want it to run on every push instead.
 
 on:
   push:
     branches: [ "**" ]
+    paths:
+      - "Meneldor/**"
+      - ".github/workflows/regression.yml"
   pull_request:
+    paths:
+      - "Meneldor/**"
+      - ".github/workflows/regression.yml"
   workflow_dispatch:
 
 jobs:
@@ -24,19 +33,19 @@ jobs:
           python-version: "3.x"
 
       - name: radio-inject acceptance selftest
-        run: python3 radio-inject selftest
+        run: python3 Meneldor/radio-inject selftest
 
       - name: radio-inject Monte Carlo
-        run: python3 montecarlo_radio_inject.py 20000 0xC0FFEE
+        run: python3 Meneldor/montecarlo_radio_inject.py 20000 0xC0FFEE
 
       - name: radioctl.sh Monte Carlo
-        run: bash montecarlo_radioctl.sh 150
+        run: bash Meneldor/montecarlo_radioctl.sh 150
 
       - name: shellcheck (informational — does not block the gate)
         continue-on-error: true
         run: |
           sudo apt-get update -y && sudo apt-get install -y shellcheck
-          shellcheck -S error radioctl.sh montecarlo_radioctl.sh
+          shellcheck -S error Meneldor/radioctl.sh Meneldor/montecarlo_radioctl.sh
 
   windows:
     name: windows — powershell campaign
@@ -46,11 +55,11 @@ jobs:
 
       - name: radioctl.ps1 smoke (one-shot dispatch)
         shell: pwsh
-        run: ./radioctl.ps1 doctor
+        run: ./Meneldor/radioctl.ps1 doctor
 
       - name: radioctl.ps1 Monte Carlo
         shell: pwsh
-        run: ./montecarlo_radioctl.ps1 -Runs 2000
+        run: ./Meneldor/montecarlo_radioctl.ps1 -Runs 2000
 
   gate:
     name: regression gate
