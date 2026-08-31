@@ -1,13 +1,15 @@
-<!-- THORONDOR // component=custom-stack-readme // stack=both // status=living-doc -->
-# Thorondor — custom radio infrastructure (Gwaihir engine · Westron config)
+<!-- THORONDOR // component=repo-front-page // stack=both // status=living-doc -->
+# Thorondor
 
-Dedicated README for the **purpose-built** part of Thorondor: the custom kernel engine,
-SDR substrate support, and the shared config model that replace OpenWrt's nuts-and-bolts
-**where the protocol requires it**. This document is **living** — updated every time a
-new piece here is tested and accepted (see the Acceptance Ledger at the bottom).
+Sovereign heterogeneous radio infrastructure. Two networks, one command philosophy —
+reuse the wheel where it exists (**802.11**), build from the SDR up where the protocol
+forbids reuse (**802.22**). This is the repo landing page: overview **and** index.
 
-> This is separate from the top-level project README, which covers the OpenWrt-hosted
-> 802.11 tooling (Meneldor / `radioctl` / `radio-inject`). Keep the two concerns isolated.
+> **Change note (this session):** the repo was flattened. The component folders
+> `Meneldor/`, `Gwaihir/`, and `Westron/` now sit at the **repo root** (no `thorondor/`
+> wrapper), and this file merges the former `thorondor/README.md` overview with the old
+> thin root index into one front page. CI path filters and all doc paths were repointed to
+> the flat, capitalized layout. See the Acceptance Ledger at the bottom.
 
 ---
 
@@ -26,10 +28,61 @@ new piece here is tested and accepted (see the Acceptance Ledger at the bottom).
   firmware/gateware and per-arch (x86_64/arm64) module builds are isolated and notated.
 - **Westron (shared config model).** One contract expresses both an 802.11 fleet **and** an
   802.22 BS/CPE cell (superframe, service flows, sensing, WSDB/GPS). It is the integration
-  seam between the two stacks. Contract + validator live in `westron/`.
-- **Verification carries over.** The Westron validator is gate-able (`--selftest`) and wired
-  into CI exactly like the Monte Carlo campaign, so the config contract can't silently
+  seam between the two stacks. Contract + validator live in `Westron/`.
+- **Verification.** The Westron validator is gate-able (`--selftest`) and the Meneldor Monte
+  Carlo campaign runs in CI, so neither the config contract nor the tooling can silently
   regress.
+
+---
+
+## Repository map
+
+| Path (repo root) | What lives here |
+|---|---|
+| `README.md` | **This file** — Thorondor overview + index (the GitHub landing page) |
+| `ARCHITECTURE.md` | Full two-stack design doc (netdev seam, inherited-vs-custom, 802.22 decomposition) |
+| `Meneldor/` | 802.11 control-plane tooling (`radioctl`, `radio-inject`) + its README, tests, and reports |
+| `Gwaihir/` | 802.22 kernel engine (design stage) + its README |
+| `Westron/` | Shared config contract — JSON Schema + semantic validator + reference config |
+| `.github/workflows/` | CI gates (must live here — GitHub only runs workflows from `.github/workflows/`) |
+
+```
+Thorondor/                      (repo root)
+  README.md                     ← this front page
+  ARCHITECTURE.md               ← two-stack design doc
+  Meneldor/                     ← 802.11 tooling (radioctl, radio-inject) + docs/tests
+    README.md  radioctl.sh  radioctl.ps1  radio-inject  radios.conf
+    montecarlo_radio_inject.py  montecarlo_radioctl.sh  montecarlo_radioctl.ps1
+    ACCEPTANCE_LOG.md  MONTECARLO_REPORT.md  HARDWARE_BOM.md
+  Gwaihir/                      ← 802.22 kernel engine (create this folder — see below)
+    README.md
+    arch/{x86_64,arm64}/  substrate/{ad936x,lms7002m,discrete}/  transport/{local,tcp}/
+  Westron/                      ← shared config contract
+    westron.schema.json  validate_westron.py  thorondor.example.json
+  .github/workflows/
+    regression.yml              ← Meneldor gate     (fires on Meneldor/**)
+    config-contract.yml         ← Westron gate      (fires on Westron/**)
+```
+
+---
+
+## Where the READMEs live (and why there are several)
+
+GitHub renders the `README.md` of **whichever folder you are viewing**. So each component
+folder gets its own front page, and the repo root gets the landing page. They never
+collide — they are different files in different folders.
+
+| README | Exact path | Renders as | Scope |
+|---|---|---|---|
+| Front page | `README.md` | the repo landing page | This overview + index |
+| Meneldor | `Meneldor/README.md` | the `Meneldor/` folder page | 802.11 control-plane tooling |
+| Gwaihir | `Gwaihir/README.md` | the `Gwaihir/` folder page | 802.22 kernel engine |
+
+`Westron/` intentionally has **no** README — it holds contract files, documented here and in
+`ARCHITECTURE.md`. Add one later if you want a per-folder page.
+
+> **Action needed:** the `Gwaihir/` folder does **not exist in the repo yet**. Create it and
+> place `Gwaihir/README.md` inside. Everything else already has its home.
 
 ---
 
@@ -49,19 +102,14 @@ inherited on both sides.
 
 ---
 
-## Gwaihir — the kernel engine
+## Gwaihir — the kernel engine (summary; full doc in `Gwaihir/README.md`)
 
-**What it is:** a Linux kernel module that (1) registers a **netdev** (`gwa0`, `gwa1`, …)
-so IP/routing/apps flow through it like any interface; (2) runs the **timing-critical
-lower-MAC** (superframe/slot scheduling on `hrtimer`s) where determinism must live; and
-(3) shuttles MPDUs to/from the **PHY** across the substrate layer.
+A Linux kernel module that (1) registers a **netdev** (`gwa0`, `gwa1`, …) so IP/routing/apps
+flow through it like any interface; (2) runs the **timing-critical lower-MAC** (superframe/
+slot scheduling on `hrtimer`s) where determinism must live; and (3) shuttles MPDUs to/from
+the **PHY** across the substrate layer. It is **not** the PHY — IQ streaming and OFDMA/
+sensing DSP run in userspace (GNU Radio / C++) or on the SDR's FPGA.
 
-**What it is NOT:** it is not the PHY. IQ sample streaming and OFDMA/sensing DSP run in
-userspace (GNU Radio / C++) or on the SDR's FPGA. Gwaihir hands the PHY scheduled MPDUs
-and timing marks; the PHY hands back demodulated MPDUs. This keeps floating-point DSP out
-of kernel space and lets the same engine drive very different PHY substrates.
-
-**Data flow:**
 ```
 apps / IP / routing
         │  (kernel netdev gwaN)  ← the seam everything flows through
@@ -81,17 +129,13 @@ apps / IP / routing
    └────────────────────────────┘
 ```
 
-**x86 first, ARM next.** Bring-up target is x86 Ubuntu. Because several COTS SDRs embed an
-ARM host (Pluto, USRP E3xx/N3xx, XTRX carriers), the module and its build must be
-arch-portable; ARM builds are isolated per `gwaihir/arch/<arch>/` (see layout).
-
 ---
 
 ## COTS SDR support matrix
 
-Goal: support the breadth of COTS SDRs. Role is decided by two questions — **can it TX?**
-and **does it cover UHF/VHF TV bands (~54–698 MHz) at ≥6 MHz?** TX-capable + TV-band =
-**BS/CPE** candidate; RX-only = **sensing / incumbent-detection / diversity** node.
+Role is decided by two questions — **can it TX?** and **does it cover UHF/VHF TV bands
+(~54–698 MHz) at ≥6 MHz?** TX-capable + TV-band = **BS/CPE** candidate; RX-only =
+**sensing / incumbent-detection / diversity** node.
 
 ### BS / CPE capable (TX, TV-band, ≥6 MHz channel)
 
@@ -120,10 +164,9 @@ and **does it cover UHF/VHF TV bands (~54–698 MHz) at ≥6 MHz?** TX-capable +
 | SDRplay RSPdx / RSPduo | discrete | 1 kHz–2 GHz | ~10 MHz | Sensing; RSPduo dual-tuner |
 | KrakenSDR | 5× coherent RTL | 24–1766 MHz | RX | Coherent sensing / direction-finding / diversity |
 
-**Firmware/substrate isolation implied by this matrix:** gateware/PHY forks by
-**transceiver family** (AD936x · LMS7002M · LMS6002D · discrete), the FPGA fabric differs
-per device, and the Gwaihir module forks by **host arch** (x86_64 · arm64). All three axes
-are isolated in the layout below.
+Firmware/substrate isolation implied by this matrix: gateware/PHY forks by **transceiver
+family** (AD936x · LMS7002M · LMS6002D · discrete); the Gwaihir module forks by **host arch**
+(x86_64 · arm64). Both axes are isolated under `Gwaihir/`.
 
 ---
 
@@ -131,82 +174,58 @@ are isolated in the layout below.
 
 The substrate layer makes the PHY source **location-transparent**: Gwaihir binds to a
 substrate descriptor that is either `local` (USB/PCIe/GbE on the same host) or `tcp`
-(a remote SDR host). Established remoting mechanisms this abstracts over: SoapySDR remote
-(`SoapySDRServer`), UHD-over-network, and `rtl_tcp` (RX). Westron expresses this per radio
-as `substrate.transport = { type: local | tcp, host, port }`. Location transparency here
-mirrors the netdev seam: nothing above the substrate layer knows or cares where the radio
-physically is.
-
----
-
-## Repo layout & notation convention (file isolation)
-
-Everything for the custom stack lives under `thorondor/` and never leaks into the
-802.11 tooling at repo root.
-
-```
-thorondor/
-  README.md                     ← this living doc
-  ARCHITECTURE.md               ← two-stack design doc
-  westron/                      ← shared config model (the contract)
-    westron.schema.json         ← canonical machine-readable contract (JSON Schema)
-    thorondor.example.json      ← reference config: 802.11 fleet + 802.22 BS/CPE
-    validate_westron.py         ← stdlib semantic validator (gate-able: --selftest)
-  gwaihir/                      ← kernel engine (design now; .ko to follow)
-    arch/x86_64/                ← x86 module build (bring-up target)
-    arch/arm64/                 ← ARM module build (Pluto/E3xx/N3xx hosts)
-    substrate/ad936x/           ← per-transceiver-family gateware/driver glue
-    substrate/lms7002m/
-    substrate/discrete/
-    transport/local/            ← USB/PCIe/GbE binding
-    transport/tcp/              ← SDR-over-TCP binding
-```
-
-**Notation header** — every file in the custom stack carries a one-line tag so its stack,
-component, arch, and status are self-evident:
-
-```
-// THORONDOR // stack=<802.11|802.22|both> // component=<name> // arch=<x86_64|arm64|any> // substrate=<family|any> // status=<design|draft|accepted>
-```
-
-Use the comment syntax of the file's language (`//`, `#`, `<!-- -->`). CI can grep this tag
-to route lint/build per stack and arch.
+(a remote SDR host). It abstracts over SoapySDR remote (`SoapySDRServer`), UHD-over-network,
+and `rtl_tcp` (RX). Westron expresses this per radio as
+`substrate.transport = { type: local | tcp, host, port }`.
 
 ---
 
 ## Shared config model (Westron)
 
-Westron is the one contract both stacks speak; it is the integration seam. Full contract,
-reference config, and validator are in `westron/`; the model is specified in
-`ARCHITECTURE.md`. Highlights:
+One contract both stacks speak; the integration seam. Full contract, reference config, and
+validator are in `Westron/`; the model is specified in `ARCHITECTURE.md`.
 
 - One `radios[]` list; each entry declares `stack: 802.11 | 802.22`.
-- 802.11 entries carry the familiar fleet fields (iface, freq, bw, mac).
-- 802.22 entries carry `role: bs | cpe`, `rf` (center/channel-bw/power), `superframe`
-  (frame/superframe/guard timing), `service_flows[]`, `sensing`, and `wsdb` (geolocation
-  gate) — plus a `substrate` block (device family, transport local/tcp, arch).
-- Validation is **semantic**, not just structural: freq-in-band, channel-bw ∈ {6,7,8},
-  superframe = k·frame, guard < frame, unique ids, BS→CPE referential integrity, sensing
-  threshold required when sensing is enabled, geo required when WSDB is enabled, `substrate`
-  required for 802.22.
+- 802.11 entries carry fleet fields (iface, freq, bw, mac).
+- 802.22 entries carry `role: bs | cpe`, `rf`, `superframe`, `service_flows[]`, `sensing`,
+  `wsdb`, plus a `substrate` block (device family, transport local/tcp, arch).
+- Validation is **semantic**: freq-in-band, channel-bw ∈ {6,7,8}, superframe = k·frame,
+  guard < frame, unique ids, BS→CPE referential integrity, conditional requirements.
 
-Run it:
 ```bash
-python3 thorondor/westron/validate_westron.py thorondor/westron/thorondor.example.json
-python3 thorondor/westron/validate_westron.py --selftest      # gate-able acceptance check
+python3 Westron/validate_westron.py Westron/thorondor.example.json
+python3 Westron/validate_westron.py --selftest      # gate-able acceptance check
 ```
 
 ---
 
-## Update policy
+## CI gates
 
-This README is updated whenever a piece of the custom stack is **tested and accepted**.
-Each accepted change appends a row to the Acceptance Ledger with what was verified and how.
+Both live in `.github/workflows/` (GitHub only runs workflows from there) and are
+path-filtered so each fires only on its own component's changes.
 
-## Acceptance Ledger
+| Workflow | Gates | Fires on changes under |
+|---|---|---|
+| `regression.yml` | Meneldor Monte Carlo campaign (radio-inject + radioctl) | `Meneldor/**` |
+| `config-contract.yml` | Westron config validation (fixture battery + reference config) | `Westron/**` |
+
+Run the same checks locally:
+```bash
+python3 Meneldor/radio-inject selftest
+python3 Westron/validate_westron.py --selftest
+```
+
+---
+
+## Update policy & Acceptance Ledger
+
+This front page is updated whenever a piece is **tested and accepted**; each accepted change
+appends a row below.
 
 | Date | Component | Change | Verification | Status |
 |---|---|---|---|---|
+| this session | Repo layout | Flattened to `Meneldor/` · `Gwaihir/` · `Westron/` at repo root (no `thorondor/` wrapper); merged former `thorondor/README.md` + thin root index into this single front page; repointed CI path filters + run steps and all doc paths to the flat, capitalized layout | gates re-run green from new paths (radio-inject selftest; Westron 21/21) | **accepted** |
 | this session | Westron config model | v0.1 contract (schema + semantic validator + reference config spanning both stacks) | `validate_westron.py --selftest` (valid/invalid fixtures) + validation of `thorondor.example.json` | **accepted** |
+| this session | `config-contract.yml` | Hardened: guard that fails CI if the reference config drifts/goes missing | YAML parses; guard reviewed | **accepted** |
 | this session | Two-stack architecture | `ARCHITECTURE.md` design doc (netdev seam, inherited-vs-custom, 802.22 decomposition) | design review (no executable artifact) | accepted (design) |
 | this session | Gwaihir engine | design + layout + SDR/substrate/arch isolation; `.ko` not yet implemented | design review | design |
